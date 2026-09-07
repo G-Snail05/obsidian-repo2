@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { getOhlc, getPerps, getSpot, type SpotProvider } from "./index.js";
+import {
+  getEthBalance,
+  getGasOracle,
+  getOhlc,
+  getPerps,
+  getSpot,
+  getTxStatus,
+  type SpotProvider,
+} from "./index.js";
 
 const program = new Command();
 program
   .name("obsidian-market")
   .description("Obsidian Division shared market-data CLI")
-  .version("0.1.0");
+  .version("0.1.1");
 
 program
   .command("spot")
@@ -39,6 +47,29 @@ program
   .action(async (symbol: string) => {
     const quote = await getPerps(symbol);
     console.log(JSON.stringify(quote, null, 2));
+  });
+
+const eth = program.command("eth").description("Etherscan Ethereum helpers");
+
+eth
+  .command("balance")
+  .argument("<address>", "0x address")
+  .action(async (address: string) => {
+    console.log(JSON.stringify(await getEthBalance(address), null, 2));
+  });
+
+eth
+  .command("gas")
+  .description("Current gas oracle")
+  .action(async () => {
+    console.log(JSON.stringify(await getGasOracle(), null, 2));
+  });
+
+eth
+  .command("tx")
+  .argument("<hash>", "transaction hash")
+  .action(async (hash: string) => {
+    console.log(JSON.stringify(await getTxStatus(hash), null, 2));
   });
 
 program.parseAsync(process.argv).catch((err: unknown) => {

@@ -29,5 +29,12 @@ export const config = {
       process.env.HYPERLIQUID_BASE_URL?.trim() ||
       "https://api.hyperliquid.xyz",
   },
+  etherscan: {
+    apiKey: process.env.ETHERSCAN_API_KEY?.trim() || undefined,
+    baseUrl:
+      process.env.ETHERSCAN_BASE_URL?.trim() ||
+      "https://api.etherscan.io/v2/api",
+    chainId: num("ETHERSCAN_CHAIN_ID", 1),
+  },
   timeoutMs: num("REQUEST_TIMEOUT_MS", 15_000),
 };
