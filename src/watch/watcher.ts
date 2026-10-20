@@ -4,6 +4,7 @@ import { Alert, CrossingEngine, DEFAULT_ALERTS_PATH, loadAlerts, saveAlerts } fr
 import { CoinbaseFeed, HyperliquidPoller, Tick } from "./feeds.js";
 import { fetchAccountData, HfMonitor } from "./hf.js";
 import { londonTime, makePayload, Notifier } from "./notify.js";
+import { PaperBook, priceFn } from "../paper/ledger.js";
 
 function num(name: string, fb: number): number {
   const n = Number(process.env[name]);
@@ -65,6 +66,9 @@ export class Watcher {
   private heartbeatSentFor?: string;
   private startedAt = Date.now();
   private configError?: string;
+  private paper = new PaperBook();
+  private paperBusy = false;
+  private paperError?: string;
 
   constructor(private c: WatchConfig) {
     fs.mkdirSync(c.stateDir, { recursive: true });
@@ -186,6 +190,7 @@ export class Watcher {
         at: this.hfAt ? new Date(this.hfAt).toISOString() : null, error: this.hfError ?? null },
       alerts: { total: this.alerts.length, enabled: this.alerts.filter((a) => a.enabled).length,
         configError: this.configError ?? null },
+      paper: { error: this.paperError ?? null },
     };
   }
 
@@ -212,6 +217,27 @@ export class Watcher {
     }
   }
 
+  async checkPaper() {
+    if (this.paperBusy) return;
+    this.paperBusy = true;
+    try {
+      for (const ev of await this.paper.check(priceFn())) {
+        const p = ev.position;
+        const msg = ev.event === "filled"
+          ? `PAPER ${p.id} ${p.side} ${p.symbol} limit filled @ ${p.entry} qty=${p.qty}`
+          : `PAPER ${p.id} ${p.side} ${p.symbol} hit ${ev.event} -> closed @ ${p.exit} pnl=$${p.pnl} (${p.r}R)`;
+        log(msg);
+        void this.notifier.send(makePayload({ type: "paper", event: ev.event, symbol: p.symbol, price: p.exit ?? p.entry,
+          level: ev.event === "stop" ? p.stop : ev.event === "target" ? p.target : p.limitPrice, note: msg, source: "paper",
+          positionId: p.id, side: p.side, pnl: p.pnl, r: p.r }));
+      }
+      this.paperError = undefined;
+    } catch (e) {
+      if (this.paperError !== (e as Error).message) log(`paper check failed: ${(e as Error).message}`);
+      this.paperError = (e as Error).message;
+    } finally { this.paperBusy = false; }
+  }
+
   sendHeartbeat() {
     const s = this.status();
     return this.notifier.send(makePayload({ type: "heartbeat", source: "obsidian-market watch",
@@ -232,6 +258,7 @@ export class Watcher {
     this.timers.push(setInterval(() => this.checkStale(), 5000));
     this.timers.push(setInterval(() => void this.pollHf(), this.c.hf.pollMin * 60_000));
     this.timers.push(setInterval(() => this.checkHeartbeat(), 30_000));
+    this.timers.push(setInterval(() => void this.checkPaper(), Number(process.env.PAPER_POLL_SEC || 5) * 1000));
     this.checkHeartbeat();
     const stop = (sig: string) => {
       log(`received ${sig}, stopping`);

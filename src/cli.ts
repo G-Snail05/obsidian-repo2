@@ -11,6 +11,7 @@ import {
 } from "./index.js";
 import fs from "node:fs";
 import { DEFAULT_ALERTS_PATH, loadAlerts, newAlertId, saveAlerts, type Alert } from "./watch/alerts.js";
+import { PaperBook, priceFn, Rejected, type Side } from "./paper/ledger.js";
 import { selfTest, watchConfig, Watcher } from "./watch/watcher.js";
 
 const program = new Command();
@@ -141,6 +142,68 @@ alert.command("enable").argument("<id>").action((id: string) =>
   mutate((alerts) => { find(alerts, id).enabled = true; return `enabled ${id}`; }));
 alert.command("disable").argument("<id>").action((id: string) =>
   mutate((alerts) => { find(alerts, id).enabled = false; return `disabled ${id}`; }));
+
+const paper = program.command("paper").description("Paper-trading ledger (.paper/ledger.json, journal .paper/journal.jsonl)");
+const fmtPos = (p: import("./paper/ledger.js").Position) =>
+  `${p.id.padEnd(4)} ${p.status.padEnd(9)} ${p.side.padEnd(5)} ${p.symbol.padEnd(5)} qty=${p.qty} entry=${p.entry ?? `limit ${p.limitPrice}`} stop=${p.stop} target=${p.target} risk=$${p.riskUsd} rr=${p.rrNet}` +
+  (p.status === "closed" ? ` exit=${p.exit} (${p.closeReason}) pnl=$${p.pnl} ${p.r}R` : "");
+
+paper.command("open")
+  .requiredOption("--symbol <sym>", "e.g. ETH (Coinbase <SYM>-USD)")
+  .requiredOption("--side <side>", "long | short")
+  .requiredOption("--entry <entry>", "market | limit price")
+  .requiredOption("--stop <price>", "stop price")
+  .requiredOption("--target <price>", "target price")
+  .requiredOption("--thesis <text>", "why this trade")
+  .requiredOption("--invalidation <text>", "what proves it wrong")
+  .requiredOption("--confidence <1-5>", "conviction 1-5")
+  .option("--json", "print JSON")
+  .action(async (o: Record<string, string | boolean>) => {
+    try {
+      const p = await new PaperBook().open({
+        symbol: String(o.symbol), side: String(o.side).toLowerCase() as Side,
+        entry: String(o.entry).toLowerCase() === "market" ? "market" : Number(o.entry),
+        stop: Number(o.stop), target: Number(o.target), thesis: String(o.thesis), invalidation: String(o.invalidation),
+        confidence: Number(o.confidence),
+      }, priceFn());
+      console.log(o.json ? JSON.stringify(p, null, 2) : `ACCEPTED ${fmtPos(p)}`);
+    } catch (e) {
+      if (e instanceof Rejected) { console.error(e.message); process.exit(2); }
+      throw e;
+    }
+  });
+
+paper.command("close").argument("<id>", "position id, e.g. P3 (pending limit = cancel)").action(async (id: string) => {
+  console.log(`CLOSED ${fmtPos(await new PaperBook().close(id, priceFn()))}`);
+});
+
+paper.command("list").option("--all", "include closed/cancelled").option("--json", "raw JSON")
+  .action((o: { all?: boolean; json?: boolean }) => {
+    const ps = new PaperBook().load().positions.filter((p) => o.all || p.status === "open" || p.status === "pending");
+    if (o.json) return console.log(JSON.stringify(ps, null, 2));
+    if (!ps.length) return console.log("(no positions)");
+    ps.forEach((p) => console.log(fmtPos(p)));
+  });
+
+paper.command("stats").option("--no-live", "skip live quotes for unrealized PnL").action(async (o: { live: boolean }) => {
+  const b = new PaperBook(); const l = b.load();
+  let quotes: Map<string, import("./paper/ledger.js").Quote> | undefined;
+  if (o.live) {
+    quotes = new Map();
+    for (const s of new Set(l.positions.filter((p) => p.status === "open").map((p) => p.symbol)))
+      try { quotes.set(s, await priceFn()(s)); } catch { /* leave out */ }
+  }
+  console.log(JSON.stringify(b.stats(l, quotes), null, 2));
+});
+
+paper.command("journal").option("-n, --last <n>", "last N entries", "20").action((o: { last: string }) => {
+  for (const j of new PaperBook().readJournal().slice(-Number(o.last))) console.log(JSON.stringify(j));
+});
+
+paper.command("reset").option("--confirm", "required: archive ledger and start fresh").action((o: { confirm?: boolean }) => {
+  if (!o.confirm) throw new Error("refusing to reset without --confirm");
+  const b = new PaperBook(); b.reset(); console.log(`ledger archived; fresh balance $${b.load().balance}`);
+});
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);

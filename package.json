@@ -15,7 +15,8 @@
     "watch:start": "scripts/watchd.sh start",
     "watch:stop": "scripts/watchd.sh stop",
     "watch:status": "scripts/watchd.sh status",
-    "watch:selftest": "node dist/cli.js watch --once"
+    "watch:selftest": "node dist/cli.js watch --once",
+    "paper:smoke": "npm run -s build && scripts/paper-smoke.sh"
   },
   "engines": {
     "node": ">=20"

@@ -57,3 +57,40 @@ node dist/cli.js watch --once         # self-test: feeds, HF, alerts file, sampl
 node dist/cli.js watch --once --send  # ...and actually POST the test heartbeat
 ```
 After changing `.env`, run `scripts/watchd.sh restart`. The supervisor does not come back by itself after a full machine reboot, so run `start` again.
+
+## Paper trading
+
+A practice ledger for Mr. Digit. Fills use live Coinbase public best bid/ask (long buys at ask / sells at bid, short the reverse), plus Coinbase Advanced taker fee and slippage on every fill. State lives in `.paper/` (gitignored): `ledger.json` plus an append-only `journal.jsonl` (opens, rejections, fills, auto-closes, manual closes, resets).
+
+```bash
+# open (market or limit). All fields required. Exit code 2 + reason if rejected.
+node dist/cli.js paper open --symbol ETH --side long --entry market --stop 2300 --target 2700 \
+  --thesis "reclaim of 2350 with rising OI" --invalidation "daily close < 2300" --confidence 3
+node dist/cli.js paper open --symbol BTC --side short --entry 84500 --stop 86500 --target 78000 \
+  --thesis "..." --invalidation "..." --confidence 2      # resting limit; watcher fills it when touched
+
+node dist/cli.js paper list [--all] [--json]
+node dist/cli.js paper close P1          # market close (or cancel a pending limit)
+node dist/cli.js paper stats [--no-live] # win rate, avg R, expectancy, PnL, equity, max DD, open risk, graduation
+node dist/cli.js paper journal -n 50
+node dist/cli.js paper reset --confirm   # archives ledger.json to ledger.json.bak-<ts>
+npm run paper:smoke                      # CLI smoke test with mocked prices in a temp dir
+```
+
+**Hard limits (enforced in code, rejected with a reason):**
+
+| Rule | Default | Env override |
+|---|---|---|
+| Starting balance | $10,000 (fixed at ledger creation) | `PAPER_START_BALANCE` |
+| Risk per trade (position auto-sized from stop distance incl. fees/slippage) | 1% of equity | `PAPER_RISK_PCT` |
+| Max open + pending positions | 3 | `PAPER_MAX_OPEN` |
+| Daily halt: today's realized loss (UK day) reaches | 3% of start-of-day equity | `PAPER_DAILY_HALT_PCT` |
+| Min reward:risk **after round-trip taker fees + slippage** | 2:1 | `PAPER_MIN_RR` |
+| Taker fee per side | 0.6% | `PAPER_TAKER_FEE_PCT` |
+| Slippage per fill | 5 bps | `PAPER_SLIPPAGE_BPS` |
+
+Also rejected: missing thesis/invalidation, confidence not 1-5, stop/target on the wrong side, marketable limits, notional above equity (no leverage).
+
+**Watcher integration:** `watch` polls Coinbase bid/ask every `PAPER_POLL_SEC` (5s) for symbols with open/pending paper positions, fills touched limits, auto-closes on stop or target, journals it and sends a `type: "paper"` webhook through the normal delivery path (dry-run if `WEBHOOK_URL` is unset).
+
+**Graduation flag** (`paper stats`): ≥30 closed trades, positive average R, max drawdown < 10%.

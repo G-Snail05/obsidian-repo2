@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-export type PayloadType = "price" | "hf" | "heartbeat" | "watcher_error";
+export type PayloadType = "price" | "hf" | "heartbeat" | "watcher_error" | "paper";
 export interface Payload {
   type: PayloadType;
   symbol?: string;
