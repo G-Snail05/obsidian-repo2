@@ -1,0 +1,14 @@
+{
+  "alerts": [
+    {
+      "id": "example-eth-below",
+      "symbol": "ETH",
+      "op": "below",
+      "level": 1,
+      "note": "EXAMPLE ONLY - placeholder, not a trading level",
+      "cooldownMin": 30,
+      "oneShot": false,
+      "enabled": false
+    }
+  ]
+}
