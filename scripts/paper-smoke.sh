@@ -14,9 +14,16 @@ $C open --symbol ETH --side long --entry market --stop 2340 --target 2462 --thes
 echo "== accepted: market long"
 $C open --symbol ETH --side long --entry market --stop 2300 --target 2700 --thesis "reclaim of 2350 with rising OI" --invalidation "daily close < 2300" --confidence 3; expect $? 0
 $C list
-echo "== price hits target -> watcher path closes it"
-px 2701 2702
-node --input-type=module -e "import {PaperBook,priceFn} from './dist/paper/ledger.js'; const ev=await new PaperBook().check(priceFn()); console.log(ev.map(e=>e.event+' '+e.position.id+' pnl='+e.position.pnl+' r='+e.position.r).join('\n'))"
+echo "== tight setup (stop 2330 / target 2560): market fails, limit 2378 passes (maker fees)"
+$C open --symbol ETH --side long --entry market --stop 2330 --target 2560 --thesis "tight" --invalidation "lose 2330" --confidence 2; expect $? 2
+$C open --symbol ETH --side long --entry 2378 --stop 2330 --target 2560 --thesis "tight, resting bid" --invalidation "lose 2330" --confidence 2; expect $? 0
+CHECK="import {PaperBook,priceFn} from './dist/paper/ledger.js'; const ev=await new PaperBook().check(priceFn()); console.log(ev.length?ev.map(e=>e.event+' '+e.position.id+' entry='+e.position.entry+' exit='+(e.position.exit??'-')+' pnl='+(e.position.pnl??'-')+' r='+(e.position.r??'-')).join('\\n'):'(no fills)')"
+echo "== touch of target 2700 (bid 2700) -> no close; trade-through (bid 2700.5) -> closes at 2700 maker"
+px 2700 2701
+node --input-type=module -e "$CHECK"
+px 2700.5 2701
+node --input-type=module -e "$CHECK"
+$C close P2; expect $? 0
 $C stats --no-live
 $C journal -n 5
 echo "== reset needs --confirm"

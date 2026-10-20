@@ -11,7 +11,9 @@ export interface PaperConfig {
   maxOpen: number;        // open + pending positions
   dailyHaltPct: number;   // halt once today's realized loss >= this % of start-of-day equity
   minRR: number;          // net reward:risk after round-trip taker fees
-  takerFeePct: number;    // per side, %
+  takerFeePct: number;    // per side, % (market entry, stop exit, manual close)
+  makerFeePct: number;    // per side, % (limit entry, target exit) - no slippage
+  tradeThroughBps: number; // resting limits fill only once price trades this far THROUGH the level
   slippageBps: number;    // applied against you on every fill
 }
 
@@ -52,7 +54,7 @@ export interface Ledger {
 }
 
 export const DEFAULT_CONFIG: PaperConfig = {
-  startingBalance: 10_000, riskPct: 1, maxOpen: 3, dailyHaltPct: 3, minRR: 2, takerFeePct: 0.6, slippageBps: 5,
+  startingBalance: 10_000, riskPct: 1, maxOpen: 3, dailyHaltPct: 3, minRR: 2, takerFeePct: 0.6, makerFeePct: 0.4, tradeThroughBps: 1, slippageBps: 5,
 };
 
 function envNum(name: string, fb: number) {
@@ -68,6 +70,8 @@ export function configFromEnv(): PaperConfig {
     minRR: envNum("PAPER_MIN_RR", DEFAULT_CONFIG.minRR),
     takerFeePct: envNum("PAPER_TAKER_FEE_PCT", DEFAULT_CONFIG.takerFeePct),
     slippageBps: envNum("PAPER_SLIPPAGE_BPS", DEFAULT_CONFIG.slippageBps),
+    makerFeePct: envNum("PAPER_MAKER_FEE_PCT", DEFAULT_CONFIG.makerFeePct),
+    tradeThroughBps: envNum("PAPER_TRADE_THROUGH_BPS", DEFAULT_CONFIG.tradeThroughBps),
   };
 }
 
@@ -123,7 +127,14 @@ export class PaperBook {
     return fs.readFileSync(this.journalFile, "utf8").split("\n").filter(Boolean).map((x) => JSON.parse(x));
   }
 
-  private fee(cfg: PaperConfig, notional: number) { return notional * cfg.takerFeePct / 100; }
+  private fee(cfg: PaperConfig, notional: number, kind: "taker" | "maker" = "taker") {
+    return notional * (kind === "maker" ? cfg.makerFeePct : cfg.takerFeePct) / 100;
+  }
+  /** Trade-through rule for resting limits. Buying at L needs ask < L*(1-b); selling at L needs bid > L*(1+b). */
+  tradedThrough(cfg: PaperConfig, buying: boolean, level: number, q: Quote) {
+    const b = cfg.tradeThroughBps / 10_000;
+    return buying ? q.ask < level * (1 - b) : q.bid > level * (1 + b);
+  }
   private slip(cfg: PaperConfig, px: number, against: "up" | "down") {
     const s = cfg.slippageBps / 10_000; return against === "up" ? px * (1 + s) : px * (1 - s);
   }
@@ -133,13 +144,15 @@ export class PaperBook {
     return buying ? this.slip(cfg, q.ask, "up") : this.slip(cfg, q.bid, "down");
   }
 
-  /** Net R:R and per-unit risk after round-trip taker fees + slippage. */
-  economics(cfg: PaperConfig, side: Side, entry: number, stop: number, target: number) {
-    const f = cfg.takerFeePct / 100, s = cfg.slippageBps / 10_000;
+  /** Net R:R and per-unit risk. Entry: maker if limit else taker (slippage already in entry).
+   *  Target exit: maker at the level, no slippage. Stop exit: taker + slippage (worst case, used for sizing). */
+  economics(cfg: PaperConfig, side: Side, entry: number, stop: number, target: number, limitEntry = false) {
+    const tk = cfg.takerFeePct / 100, mk = cfg.makerFeePct / 100, s = cfg.slippageBps / 10_000;
+    const fe = limitEntry ? mk : tk;
     const dir = side === "long" ? 1 : -1;
-    const stopFill = stop * (1 - dir * s), targetFill = target * (1 - dir * s);
-    const riskPerUnit = dir * (entry - stopFill) + f * (entry + stopFill);
-    const rewardPerUnit = dir * (targetFill - entry) - f * (entry + targetFill);
+    const stopFill = stop * (1 - dir * s);
+    const riskPerUnit = dir * (entry - stopFill) + fe * entry + tk * stopFill;
+    const rewardPerUnit = dir * (target - entry) - fe * entry - mk * target;
     return { riskPerUnit, rewardPerUnit, rr: rewardPerUnit / riskPerUnit };
   }
 
@@ -187,9 +200,9 @@ export class PaperBook {
       const mkt = this.fillPrice(cfg, inp.side, "enter", q);
       if (dir * (entry - mkt) >= 0) reject(`limit ${entry} is already marketable (would fill at ${round(mkt, 4)}); use --entry market`);
     }
-    const e = this.economics(cfg, inp.side, entry, inp.stop, inp.target);
+    const e = this.economics(cfg, inp.side, entry, inp.stop, inp.target, !market);
     if (e.rewardPerUnit <= 0 || e.rr < cfg.minRR - 1e-9)
-      reject(`reward:risk after fees is ${e.rr.toFixed(2)}:1, below the ${cfg.minRR}:1 minimum (fee ${cfg.takerFeePct}%/side, slippage ${cfg.slippageBps}bps)`);
+      reject(`reward:risk after fees is ${e.rr.toFixed(2)}:1, below the ${cfg.minRR}:1 minimum (entry ${market ? `taker ${cfg.takerFeePct}% + ${cfg.slippageBps}bps slip` : `maker ${cfg.makerFeePct}%`}, target maker ${cfg.makerFeePct}%, stop taker ${cfg.takerFeePct}% + slip)`);
 
     const riskUsd = l.balance * cfg.riskPct / 100;
     const qty = round(riskUsd / e.riskPerUnit, 8);
@@ -215,9 +228,10 @@ export class PaperBook {
   /** Close at market (manual) or at trigger. Fees deducted, PnL realized. */
   closeAt(l: Ledger, p: Position, q: Quote, reason: Position["closeReason"]) {
     const cfg = l.config;
-    const exit = this.fillPrice(cfg, p.side, "exit", q);
+    const maker = reason === "target";
+    const exit = maker ? p.target : this.fillPrice(cfg, p.side, "exit", q);
     const dir = p.side === "long" ? 1 : -1;
-    const exitFee = this.fee(cfg, exit * p.qty);
+    const exitFee = this.fee(cfg, exit * p.qty, maker ? "maker" : "taker");
     const pnl = dir * (exit - p.entry!) * p.qty - (p.entryFee ?? 0) - exitFee;
     Object.assign(p, { status: "closed", exit: round(exit, 8), exitFee: round(exitFee, 4), closedAt: this.now().toISOString(),
       closeReason: reason, pnl: round(pnl, 2), r: round(pnl / p.riskUsd, 3) });
@@ -252,10 +266,9 @@ export class PaperBook {
       const q = quotes.get(p.symbol)!;
       const long = p.side === "long";
       if (p.status === "pending") {
-        const px = long ? q.ask : q.bid;
-        if (long ? px <= p.limitPrice! : px >= p.limitPrice!) {
-          const fill = this.fillPrice(l.config, p.side, "enter", { ...q, ask: Math.min(q.ask, p.limitPrice!), bid: Math.max(q.bid, p.limitPrice!) });
-          Object.assign(p, { status: "open", entry: round(fill, 8), entryFee: round(this.fee(l.config, fill * p.qty), 4), openedAt: this.now().toISOString() });
+        if (this.tradedThrough(l.config, long, p.limitPrice!, q)) {
+          const fill = p.limitPrice!; // maker: filled at the level, no slippage
+          Object.assign(p, { status: "open", entry: round(fill, 8), entryFee: round(this.fee(l.config, fill * p.qty, "maker"), 4), openedAt: this.now().toISOString() });
           out.push({ event: "filled", position: p });
           this.journal("filled", { position: p, quote: q });
         }
@@ -263,7 +276,7 @@ export class PaperBook {
       }
       const exitSide = long ? q.bid : q.ask;
       const hitStop = long ? exitSide <= p.stop : exitSide >= p.stop;
-      const hitTarget = long ? exitSide >= p.target : exitSide <= p.target;
+      const hitTarget = this.tradedThrough(l.config, !long, p.target, q);
       if (hitStop || hitTarget) {
         const reason = hitStop ? "stop" : "target";
         this.closeAt(l, p, q, reason);

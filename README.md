@@ -60,7 +60,11 @@ After changing `.env`, run `scripts/watchd.sh restart`. The supervisor does not 
 
 ## Paper trading
 
-A practice ledger for Mr. Digit. Fills use live Coinbase public best bid/ask (long buys at ask / sells at bid, short the reverse), plus Coinbase Advanced taker fee and slippage on every fill. State lives in `.paper/` (gitignored): `ledger.json` plus an append-only `journal.jsonl` (opens, rejections, fills, auto-closes, manual closes, resets).
+A practice ledger for Mr. Digit. Fills use live Coinbase public best bid/ask. **Fee mix:** market entries, stop exits and manual closes are taker (0.6%) plus slippage, filled at ask (buy) / bid (sell). Limit entries and target exits are resting maker orders (0.4%), filled at the level with no slippage.
+
+**Trade-through rule (conservative, applies to limit entries and targets):** a resting buy at L fills only when the **ask** < L × (1 − b); a resting sell at L fills only when the **bid** > L × (1 + b), with b = `PAPER_TRADE_THROUGH_BPS` (1 bp). A touch never fills. So a long limit or short target fills off the ask, and a short limit or long target fills off the bid. Stops trigger on touch (bid ≤ stop for longs, ask ≥ stop for shorts).
+
+**Reward:risk at open** uses that mix: the entry fee is maker if the entry is a limit, otherwise taker plus slippage. The target leg is maker at the level, and the stop leg is taker plus slippage. Position size comes from the stop leg, which is the worst case. State lives in `.paper/` (gitignored): `ledger.json` plus an append-only `journal.jsonl` (opens, rejections, fills, auto-closes, manual closes, resets).
 
 ```bash
 # open (market or limit). All fields required. Exit code 2 + reason if rejected.
@@ -85,12 +89,14 @@ npm run paper:smoke                      # CLI smoke test with mocked prices in 
 | Risk per trade (position auto-sized from stop distance incl. fees/slippage) | 1% of equity | `PAPER_RISK_PCT` |
 | Max open + pending positions | 3 | `PAPER_MAX_OPEN` |
 | Daily halt: today's realized loss (UK day) reaches | 3% of start-of-day equity | `PAPER_DAILY_HALT_PCT` |
-| Min reward:risk **after round-trip taker fees + slippage** | 2:1 | `PAPER_MIN_RR` |
-| Taker fee per side | 0.6% | `PAPER_TAKER_FEE_PCT` |
-| Slippage per fill | 5 bps | `PAPER_SLIPPAGE_BPS` |
+| Min reward:risk **after the fee mix above** | 2:1 | `PAPER_MIN_RR` |
+| Taker fee (market entry, stop, manual close) | 0.6% | `PAPER_TAKER_FEE_PCT` |
+| Maker fee (limit entry, target) | 0.4% | `PAPER_MAKER_FEE_PCT` |
+| Slippage per taker fill | 5 bps | `PAPER_SLIPPAGE_BPS` |
+| Trade-through buffer for limits/targets | 1 bp | `PAPER_TRADE_THROUGH_BPS` |
 
 Also rejected: missing thesis/invalidation, confidence not 1-5, stop/target on the wrong side, marketable limits, notional above equity (no leverage).
 
-**Watcher integration:** `watch` polls Coinbase bid/ask every `PAPER_POLL_SEC` (5s) for symbols with open/pending paper positions, fills touched limits, auto-closes on stop or target, journals it and sends a `type: "paper"` webhook through the normal delivery path (dry-run if `WEBHOOK_URL` is unset).
+**Watcher integration:** `watch` polls Coinbase bid/ask every `PAPER_POLL_SEC` (5s) for symbols with open/pending paper positions, fills limits that trade through, auto-closes on stop or a traded-through target, journals it and sends a `type: "paper"` webhook through the normal delivery path (dry-run if `WEBHOOK_URL` is unset).
 
 **Graduation flag** (`paper stats`): ≥30 closed trades, positive average R, max drawdown < 10%.

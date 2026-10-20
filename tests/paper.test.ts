@@ -65,20 +65,62 @@ test("auto-stop, auto-target, daily halt at 3% and UK day rollover", async () =>
   assert.ok(a.id && t.id);
 });
 
-test("limit order fills when touched; short works; stats + graduation flag", async () => {
+test("limit entry: touch does not fill, trade-through does, at the level with maker fee", async () => {
   px = { ETH: [2380, 2381] }; const b = book();
   await assert.rejects(b.open({ ...base, entry: 2390 }, price), /marketable/);
   const p = await b.open({ ...base, entry: 2350, stop: 2290, target: 2600 }, price);
   assert.equal(p.status, "pending");
-  px = { ETH: [2349, 2350] };
-  assert.equal((await b.check(price))[0].event, "filled");
-  const sh = await b.open({ ...base, side: "short", stop: 2420, target: 2100 }, price);
-  assert.equal(sh.status, "open"); assert.ok(sh.entry! < 2349);
-  px = { ETH: [2099, 2100] };
+  px = { ETH: [2349, 2350] };             // touch
+  assert.equal((await b.check(price)).length, 0);
+  px = { ETH: [2349.5, 2349.8] };         // ask 2349.8 not < 2350*(1-1bp)=2349.765
+  assert.equal((await b.check(price)).length, 0);
+  px = { ETH: [2349.5, 2349.7] };         // through
   const ev = await b.check(price);
-  assert.equal(ev.find((e) => e.position.id === sh.id)!.event, "target");
+  assert.equal(ev[0].event, "filled");
+  assert.equal(ev[0].position.entry, 2350);
+  assert.ok(Math.abs(ev[0].position.entryFee! - 2350 * ev[0].position.qty * 0.004) < 1e-3);
+});
+
+test("target: touch does not close; trade-through closes at target, maker fee, no slippage", async () => {
+  px = { ETH: [2380, 2381] }; const b = book();
+  const p = await b.open(base, price);
+  px = { ETH: [2700, 2701] };
+  assert.equal((await b.check(price)).length, 0);
+  px = { ETH: [2700.5, 2701] };            // bid > 2700*(1+1bp)=2700.27
+  const ev = await b.check(price);
+  assert.equal(ev[0].event, "target");
+  const c = ev[0].position;
+  assert.equal(c.exit, 2700);
+  assert.ok(Math.abs(c.exitFee! - 2700 * p.qty * 0.004) < 1e-3);
+});
+
+test("stop exit is taker + slippage", async () => {
+  px = { ETH: [2380, 2381] }; const b = book();
+  const p = await b.open(base, price);
+  px = { ETH: [2299, 2300] };
+  const c = (await b.check(price))[0].position;
+  assert.ok(Math.abs(c.exit! - 2299 * (1 - 0.0005)) < 1e-6);
+  assert.ok(Math.abs(c.exitFee! - c.exit! * p.qty * 0.006) < 1e-3);
+});
+
+test("short: limit trades through via bid, target via ask", async () => {
+  px = { ETH: [2380, 2381] }; const b = book();
+  const sh = await b.open({ ...base, side: "short", entry: 2400, stop: 2440, target: 2200 }, price);
+  px = { ETH: [2400, 2401] }; assert.equal((await b.check(price)).length, 0);
+  px = { ETH: [2400.5, 2401] }; assert.equal((await b.check(price))[0].event, "filled");
+  px = { ETH: [2199, 2200] }; assert.equal((await b.check(price)).length, 0);
+  px = { ETH: [2199, 2199.7] };
+  const c = (await b.check(price))[0].position;
+  assert.equal(c.closeReason, "target"); assert.equal(c.exit, 2200); assert.ok(c.r! > 2);
   const st = b.stats();
-  assert.equal(st.trades, 2); // long limit got stopped on the same drop assert.equal(st.graduation.ready, false); assert.equal(st.graduation.closedTrades, false);
-  assert.equal(st.openPositions, 0); assert.equal(st.openRiskUsd, 0); assert.equal(st.winRate, 50);
+  assert.equal(st.trades, 1); assert.equal(st.graduation.ready, false); assert.equal(st.openRiskUsd, 0);
   assert.ok(b.readJournal().some((j) => j.event === "auto_target"));
+  assert.ok(sh.id);
+});
+
+test("fee mix: tight setup fails as market (taker) but passes as limit (maker)", async () => {
+  px = { ETH: [2380, 2381] }; const b = book();
+  await assert.rejects(b.open({ ...base, entry: "market", stop: 2330, target: 2560 }, price), /reward:risk/);
+  const p = await b.open({ ...base, entry: 2378, stop: 2330, target: 2560 }, price);
+  assert.ok(p.rrNet >= 2);
 });
